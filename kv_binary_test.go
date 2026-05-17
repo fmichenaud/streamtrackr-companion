@@ -167,6 +167,24 @@ func TestParseBinaryKV_RejectsEmptyDocument(t *testing.T) {
 	}
 }
 
+func TestParseBinaryKV_RejectsDeeplyNested(t *testing.T) {
+	// Build a doc nested kvMaxDepth+10 levels deep. Without the depth
+	// guard this would blow the goroutine stack on a crafted file
+	// dropped into appcache/stats/ by malware or another local user.
+	var b kvBuild
+	depth := kvMaxDepth + 10
+	for i := 0; i < depth; i++ {
+		b.byte_(kvNone)
+		b.name("n")
+	}
+	for i := 0; i < depth; i++ {
+		b.byte_(kvEnd)
+	}
+	if _, err := parseBinaryKV(b.bytes()); err == nil {
+		t.Errorf("expected error past %d levels of nesting, got nil", kvMaxDepth)
+	}
+}
+
 func TestKVNode_ChildNilSafe(t *testing.T) {
 	// Chained walks like root.Child("a").Child("b").AsInt() must not
 	// crash when "a" is missing — the call site stays clean of nil

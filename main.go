@@ -133,6 +133,12 @@ func runWatcher() {
 	logf("  os      : %s/%s", runtime.GOOS, runtime.GOARCH)
 	logf("  poll    : %s", *pollF)
 	logf("  pid     : %d", os.Getpid())
+	// Push runForGame / runAutoMode through the same atomic globals the
+	// tray uses — keeps the rest of the code free of "is this CLI or
+	// tray" branches and lets a tray-style re-auth (none in CLI today,
+	// but cheap to support) work end-to-end.
+	setBackend(*backendF)
+	setToken(*tokenF)
 	if *tokenF != "" {
 		logf("  backend : %s (push enabled)", *backendF)
 		state.setAuthenticated(true)
@@ -143,7 +149,7 @@ func runWatcher() {
 	if *appidF != 0 {
 		state.setMode("manual")
 		logf("  mode    : manual (-appid %d)", *appidF)
-		_ = runForGame(uint32(*appidF), *pollF, *tokenF, *backendF, nil, nil)
+		_ = runForGame(uint32(*appidF), *pollF, nil, nil)
 		return
 	}
 
@@ -160,7 +166,7 @@ Or run in manual mode:
 
 	state.setMode("auto")
 	logf("  mode    : auto-detect (poll backend every %s)", *detectF)
-	runAutoMode(*detectF, *pollF, *tokenF, *backendF, nil)
+	runAutoMode(*detectF, *pollF, nil)
 }
 
 // ────────────────────────────── Tray watcher ───────────────────────────────
@@ -198,7 +204,7 @@ func runWatcherLoopForTray(done <-chan struct{}) {
 		go refreshIdentity(backend, token)
 	}
 
-	runAutoMode(5*time.Second, 250*time.Millisecond, token, backend, done)
+	runAutoMode(5*time.Second, 250*time.Millisecond, done)
 }
 
 // ensureAuthenticated shows the welcome dialog, runs the loopback OAuth
@@ -314,8 +320,10 @@ func setToken(v string)   { tokenFlag.Store(&v) }
 // runAutoMode reads RunningAppID, hands the appid to runForGame, and
 // loops on game changes. Backend /current-game is a fallback when the
 // registry read fails; pinged once a minute regardless to keep the
-// server-side companion heartbeat alive.
-func runAutoMode(detectInterval, poll time.Duration, token, backend string, done <-chan struct{}) {
+// server-side companion heartbeat alive. Token + backend are read from
+// the atomic globals on every call so a mid-session re-login or logout
+// from the tray menu takes effect immediately.
+func runAutoMode(detectInterval, poll time.Duration, done <-chan struct{}) {
 	logf("%s waiting for a Steam game…", stamp())
 
 	const heartbeatInterval = 60 * time.Second
@@ -324,7 +332,7 @@ func runAutoMode(detectInterval, poll time.Duration, token, backend string, done
 		if time.Since(lastHeartbeat) < heartbeatInterval {
 			return
 		}
-		go pollCurrentGame(backend, token)
+		go pollCurrentGame(currentBackend(), currentToken())
 		lastHeartbeat = time.Now()
 	}
 
@@ -341,12 +349,8 @@ func runAutoMode(detectInterval, poll time.Duration, token, backend string, done
 
 		appid, name, localErr := detectLocalGame()
 		if localErr != nil {
-			// Fall back to the backend route — slower + needs a Steam
-			// tracker on the user's account to resolve their username.
-			// Logged so a Windows user with a broken registry path can
-			// debug from streamtrackr-companion.log.
 			logf("local detect failed (%v) — falling back to /current-game", localErr)
-			appid, name = pollCurrentGame(backend, token)
+			appid, name = pollCurrentGame(currentBackend(), currentToken())
 			lastHeartbeat = time.Now()
 		} else {
 			pingHeartbeat()
@@ -374,7 +378,7 @@ func runAutoMode(detectInterval, poll time.Duration, token, backend string, done
 			}
 			return cur == sessionAppid
 		}
-		_ = runForGame(appid, poll, token, backend, isStillCurrent, done)
+		_ = runForGame(appid, poll, isStillCurrent, done)
 		logf("%s ◼ session ended for appid %d", stamp(), appid)
 
 		// Drain a short delay before the next detect cycle, respecting cancellation.
@@ -389,11 +393,12 @@ func runAutoMode(detectInterval, poll time.Duration, token, backend string, done
 // runForGame reads the schema + stats baseline, then polls the stats
 // file's mtime for new unlocks. Returns when done closes or
 // isStillCurrent goes false. Pre-loop errors are non-fatal — log and
-// park until the session ends.
+// park until the session ends. Token + backend are read fresh from the
+// atomic globals on each push so re-login from the tray takes effect
+// without waiting for the session to end.
 func runForGame(
 	appid uint32,
 	poll time.Duration,
-	token, backend string,
 	isStillCurrent func() bool,
 	done <-chan struct{},
 ) error {
@@ -466,8 +471,10 @@ func runForGame(
 			if isUnlocked && !prev[apiName] {
 				logf("%s 🏆 UNLOCKED %s", stamp(), apiName)
 				state.recordUnlock(apiName)
+				// Read token+backend fresh so a mid-session re-login
+				// from the tray takes effect on the very next push.
 				// Display name is resolved server-side from the Web API.
-				go pushUnlock(backend, token, appid, apiName, "")
+				go pushUnlock(currentBackend(), currentToken(), appid, apiName, "")
 			}
 		}
 		prev = next

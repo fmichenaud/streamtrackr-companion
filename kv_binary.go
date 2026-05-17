@@ -38,12 +38,17 @@ type kvNode struct {
 	Children []*kvNode
 }
 
+// Cap nested-object recursion. Real Steam schemas hit ~5 levels; 32 is
+// 6× safety margin while guarding against a crafted file in
+// appcache/stats/ blowing the goroutine stack on parse.
+const kvMaxDepth = 32
+
 // parseBinaryKV decodes a complete document and returns its single
 // top-level node.
 func parseBinaryKV(data []byte) (*kvNode, error) {
 	r := bytes.NewReader(data)
 	root := &kvNode{Type: kvNone}
-	if err := readKVChildren(r, root); err != nil {
+	if err := readKVChildren(r, root, 0); err != nil {
 		return nil, err
 	}
 	if len(root.Children) == 0 {
@@ -52,7 +57,10 @@ func parseBinaryKV(data []byte) (*kvNode, error) {
 	return root.Children[0], nil
 }
 
-func readKVChildren(r *bytes.Reader, parent *kvNode) error {
+func readKVChildren(r *bytes.Reader, parent *kvNode, depth int) error {
+	if depth > kvMaxDepth {
+		return fmt.Errorf("kv: max nesting depth %d exceeded", kvMaxDepth)
+	}
 	for {
 		typ, err := r.ReadByte()
 		if err == io.EOF {
@@ -73,7 +81,7 @@ func readKVChildren(r *bytes.Reader, parent *kvNode) error {
 
 		switch typ {
 		case kvNone:
-			if err := readKVChildren(r, child); err != nil {
+			if err := readKVChildren(r, child, depth+1); err != nil {
 				return fmt.Errorf("kv: children of %q: %w", name, err)
 			}
 		case kvString:

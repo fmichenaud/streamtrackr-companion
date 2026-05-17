@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -182,7 +183,9 @@ func exchangeCode(backend, code, state, label string) (string, error) {
 		ExpiresAt string `json:"expiresAt"`
 		Message   string `json:"message"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	// Cap response body — backend URL is user-controlled (flag + env),
+	// so a rogue or MITM-downgraded endpoint could otherwise OOM us.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&decoded); err != nil {
 		return "", fmt.Errorf("HTTP %d: non-JSON response", resp.StatusCode)
 	}
 	if resp.StatusCode != 200 || decoded.Token == "" {
