@@ -1,0 +1,191 @@
+name: Release companion
+
+# Triggered by pushing a semver tag (e.g. `git tag v1.2.3 && git push origin v1.2.3`).
+# Builds the unsigned binary + NSIS installer on a Windows runner and
+# publishes both as assets attached to a GitHub Release.
+#
+# The companion's in-app auto-updater hits the manifest endpoint on the
+# StreamTrackr API, which is configured with COMPANION_LATEST_URL pointing
+# to the bare .exe URL on GitHub Releases. Public repo + GitHub Releases
+# means no infrastructure, no hosting cost, and a stable download URL.
+#
+# Code signing is intentionally deferred — see README for context.
+# Users will see a one-time SmartScreen "More info → Run anyway" prompt
+# on first launch; the binary's reputation builds over time without a cert.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without v prefix, e.g. 1.2.3). Leave empty to derive from tag.'
+        required: false
+
+permissions:
+  contents: write  # required to create a GitHub Release + upload assets
+
+jobs:
+  build-publish:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          # Strip the leading "v" from the tag, or use the manual input
+          # when the workflow was triggered via workflow_dispatch.
+          if [[ -n "${{ inputs.version }}" ]]; then
+            v="${{ inputs.version }}"
+          else
+            v="${GITHUB_REF_NAME#v}"
+          fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          echo "Releasing companion v$v"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install -y --no-progress nsis
+          # Chocolatey doesn't refresh PATH within the running pwsh
+          # session — write the install path to GITHUB_PATH so the next
+          # steps can find makensis.exe.
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # ── Build ────────────────────────────────────────────────────────
+      # CGO is required by getlantern/systray. windows-latest ships
+      # mingw-w64 so cgo works out of the box, no extra setup needed.
+
+      - name: Build companion .exe
+        shell: pwsh
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          go build `
+            -ldflags "-s -w -H=windowsgui -X main.version=${{ steps.version.outputs.value }}" `
+            -o streamtrackr-companion.exe `
+            .
+
+      - name: Build NSIS installer
+        shell: pwsh
+        working-directory: installer
+        run: |
+          # Quote the -D arg: PowerShell parses 0.1.0 as numeric.method.method
+          # and corrupts the value before passing it to makensis, which
+          # then receives "-DAPP_VERSION=0.1" + ".0" as separate tokens.
+          makensis -V2 "-DAPP_VERSION=${{ steps.version.outputs.value }}" installer.nsi
+
+      # ── Compute SHA-256 ──────────────────────────────────────────────
+      # The auto-updater verifies the downloaded .exe against this hash
+      # (manifest field COMPANION_LATEST_SHA256), so a corrupted or
+      # tampered download is rejected before being applied.
+
+      - name: Compute SHA-256 of artefacts
+        id: hashes
+        shell: pwsh
+        run: |
+          $exeHash   = (Get-FileHash streamtrackr-companion.exe          -Algorithm SHA256).Hash.ToLower()
+          $setupHash = (Get-FileHash installer\streamtrackr-companion-setup.exe -Algorithm SHA256).Hash.ToLower()
+          echo "exe=$exeHash"     >> $env:GITHUB_OUTPUT
+          echo "setup=$setupHash" >> $env:GITHUB_OUTPUT
+
+      # ── Generate manifest.json ──────────────────────────────────────
+      # The companion's auto-updater fetches this file from the stable
+      # /releases/latest/download/manifest.json URL on every poll. That's
+      # how a new release auto-rolls out to running clients without any
+      # backend touch — push a tag, the manifest updates on GitHub, the
+      # next poll picks up the new version.
+
+      - name: Generate manifest.json
+        shell: pwsh
+        env:
+          V: ${{ steps.version.outputs.value }}
+          REPO: ${{ github.repository }}
+          EXE_SHA: ${{ steps.hashes.outputs.exe }}
+        run: |
+          $manifest = [ordered]@{
+            version = "$env:V"
+            url     = "https://github.com/$env:REPO/releases/download/v$env:V/streamtrackr-companion.exe"
+            sha256  = "$env:EXE_SHA"
+          }
+          # -NoNewline so the JSON file has a stable byte content across
+          # platforms (no trailing CRLF/LF mismatch that would alter the
+          # asset hash on subsequent runs).
+          $manifest | ConvertTo-Json | Out-File -FilePath manifest.json -Encoding utf8 -NoNewline
+          Get-Content manifest.json
+
+      # ── Publish to GitHub Releases ───────────────────────────────────
+      # softprops/action-gh-release creates the Release if it doesn't
+      # exist yet (idempotent on re-runs), attaches both artefacts, and
+      # populates the release notes from the body below. The tag itself
+      # is the version source of truth.
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          name: Companion v${{ steps.version.outputs.value }}
+          draft: false
+          prerelease: false
+          files: |
+            streamtrackr-companion.exe
+            installer/streamtrackr-companion-setup.exe
+            manifest.json
+          body: |
+            ## StreamTrackr Companion v${{ steps.version.outputs.value }}
+
+            ### Downloads
+            - [`streamtrackr-companion-setup.exe`](https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.value }}/streamtrackr-companion-setup.exe) — Windows installer (recommended for first-time install)
+            - [`streamtrackr-companion.exe`](https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.value }}/streamtrackr-companion.exe) — Bare executable (used by the in-app auto-updater)
+
+            ### Checksums (SHA-256)
+            ```
+            streamtrackr-companion.exe        ${{ steps.hashes.outputs.exe }}
+            streamtrackr-companion-setup.exe  ${{ steps.hashes.outputs.setup }}
+            ```
+
+            ### Note about Windows SmartScreen
+            Because this release isn't yet code-signed, Windows may display a
+            "Windows protected your PC" warning on first launch. Click
+            **More info → Run anyway** to continue. The warning will fade as
+            more users install the same binary (SmartScreen reputation
+            builds automatically).
+
+      # ── Summary — what the human needs to do next ───────────────────
+
+      - name: Print release info
+        shell: pwsh
+        env:
+          V: ${{ steps.version.outputs.value }}
+        run: |
+          $repo     = "${{ github.repository }}"
+          $exeSha   = "${{ steps.hashes.outputs.exe }}"
+          $setupSha = "${{ steps.hashes.outputs.setup }}"
+          @"
+          ## :white_check_mark: Companion v$env:V published
+
+          The auto-updater fetches the manifest directly from GitHub —
+          nothing to do on the backend, running clients will pick this
+          up within 30 s of their next launch (or max 6 h via the ticker).
+
+          ### Download URLs
+          - **Installer (latest)**: https://github.com/$repo/releases/latest/download/streamtrackr-companion-setup.exe
+          - **Installer (versioned)**: https://github.com/$repo/releases/download/v$env:V/streamtrackr-companion-setup.exe
+          - **Bare .exe (auto-updater)**: https://github.com/$repo/releases/download/v$env:V/streamtrackr-companion.exe
+          - **Manifest**: https://github.com/$repo/releases/latest/download/manifest.json
+
+          ### Checksums (SHA-256)
+          ``````
+          streamtrackr-companion.exe        $exeSha
+          streamtrackr-companion-setup.exe  $setupSha
+          ``````
+          "@ | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
