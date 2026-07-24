@@ -35,7 +35,7 @@ GO_ENV      := CGO_ENABLED=1 \
                GOOS=windows GOARCH=amd64
 GO_LDFLAGS  := -s -w -H=windowsgui -X main.version=$(VERSION)
 
-.PHONY: build installer mac clean help
+.PHONY: build installer mac clean help stats
 
 build: $(BINARY)
 	@ls -lh $(BINARY)
@@ -68,6 +68,23 @@ mac:
 
 clean:
 	rm -f $(BINARY) $(INSTALLER) $(SYSO)
+
+# Release download counts + 14-day traffic snapshot. Requires `gh` CLI
+# authenticated against the repo owner (push-access endpoints for
+# traffic). manifest.json is the proxy for "active installations" —
+# every running companion polls it on startup + every 6h.
+stats:
+	@echo "=== Downloads per release ==="
+	@gh api repos/fmichenaud/streamtrackr-companion/releases \
+		--jq '.[] | "[\(.tag_name)]  \(.assets | map("\(.download_count)× \(.name)") | join("  "))"'
+	@echo
+	@echo "=== Traffic (last 14 days) ==="
+	@printf 'views   '; gh api repos/fmichenaud/streamtrackr-companion/traffic/views  --jq '"\(.count) total / \(.uniques) unique"'
+	@printf 'clones  '; gh api repos/fmichenaud/streamtrackr-companion/traffic/clones --jq '"\(.count) total / \(.uniques) unique"'
+	@echo
+	@echo "=== Top referrers ==="
+	@gh api repos/fmichenaud/streamtrackr-companion/traffic/popular/referrers \
+		--jq '.[] | "\(.count)\t\(.uniques) unique\t\(.referrer)"' || true
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sed -e 's/:.*##/ — /'
