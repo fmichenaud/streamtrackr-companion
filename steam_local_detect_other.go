@@ -14,6 +14,13 @@ func detectLocalGame() (uint32, string, error) {
 	return 0, "", fmt.Errorf("local Steam detection is Windows-only")
 }
 
+// readActiveUserID3 has no equivalent off Windows — the value lives in
+// the registry. Resolution falls through to loginusers.vdf / userdata,
+// which is what --dump-stats against a copied Steam tree needs anyway.
+func readActiveUserID3() (uint32, error) {
+	return 0, fmt.Errorf("registry lookup is Windows-only")
+}
+
 // readSteamPath supports --dump-stats against a Steam dump copied from
 // a Windows machine. Honours $STEAMPATH; falls back to the Linux path.
 func readSteamPath() (string, error) {

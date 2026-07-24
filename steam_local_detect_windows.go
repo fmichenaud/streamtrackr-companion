@@ -60,6 +60,35 @@ func readRunningAppID() (uint32, error) {
 	return uint32(v), nil
 }
 
+// readActiveUserID3 reads the account ID (steamID3) of the account the
+// running client is signed in as. Steam writes it on sign-in and zeroes
+// it on sign-out, which makes it the only source that can't drift out of
+// sync with reality — unlike loginusers.vdf, which is a persisted record
+// of past logins.
+//
+// Returns (0, nil) when Steam is running signed-out or has never signed
+// in; the caller falls through to the file-based sources.
+func readActiveUserID3() (uint32, error) {
+	key, err := registry.OpenKey(
+		registry.CURRENT_USER,
+		`Software\Valve\Steam\ActiveProcess`,
+		registry.QUERY_VALUE,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("open ActiveProcess key: %w", err)
+	}
+	defer key.Close()
+
+	v, _, err := key.GetIntegerValue("ActiveUser")
+	if err != nil {
+		if err == registry.ErrNotExist {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read ActiveUser: %w", err)
+	}
+	return uint32(v), nil
+}
+
 // readSteamPath returns the Steam install directory (follows custom
 // install locations).
 func readSteamPath() (string, error) {

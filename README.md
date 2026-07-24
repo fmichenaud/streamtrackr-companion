@@ -166,7 +166,7 @@ access to as your own user.
 ├── welcome_windows.go       First-launch native MessageBox
 ├── dialog_windows.go        Reusable MessageBox helpers
 ├── kv_binary.go             Valve BinaryKV (binary VDF) parser
-├── steam_user.go            Active steamID3 resolution via loginusers.vdf
+├── steam_user.go            Active steamID3: registry → loginusers.vdf → userdata
 ├── stats_reader.go          Schema + user-stats cache reader + bitmask math
 ├── stats_watcher.go         mtime polling primitive
 ├── assets/icon.ico          Tray + window icon (multi-res 16/32/48)

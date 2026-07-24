@@ -407,10 +407,9 @@ func runForGame(
 		logf("%s readSteamPath: %v — can't watch achievements without a Steam install", stamp(), err)
 		return waitUntilDoneOrInactive(done, isStillCurrent)
 	}
-	steamID3, err := readCurrentSteamID3(steamPath)
-	if err != nil {
-		logf("%s readCurrentSteamID3: %v — Steam hasn't been logged in?", stamp(), err)
-		return waitUntilDoneOrInactive(done, isStillCurrent)
+	steamID3, idSource, ok := resolveSteamID3Blocking(steamPath, done, isStillCurrent)
+	if !ok {
+		return nil
 	}
 
 	// Schema file may arrive a few seconds after game launch if Steam
@@ -451,10 +450,16 @@ func runForGame(
 	current := state.snapshot()
 	state.setGame(current.CurrentAppID, current.CurrentGameName, unlockedNow, total)
 	logf("%s baseline: %d/%d unlocked.", stamp(), unlockedNow, total)
-	logf("%s steamID3=%d (steamID64=%d)", stamp(), steamID3, steamID64FromAccountID(steamID3))
+	logf("%s steamID3=%d (steamID64=%d) via %s", stamp(), steamID3, steamID64FromAccountID(steamID3), idSource)
 
 	statsPath := statsCachePath(steamPath, steamID3, appid)
 	logf("%s watching %s", stamp(), statsPath)
+	// A missing stats file is normal before the first StoreStats, but
+	// paired with a guessed account it's the fingerprint of having picked
+	// the wrong one — say so in the log rather than sitting silent.
+	if _, err := os.Stat(statsPath); os.IsNotExist(err) && idSource != "registry ActiveUser" {
+		logf("%s note: no stats file yet for this account — expected if the game was never played on it", stamp())
+	}
 
 	// Only push 0→1 transitions. Re-locks (SAM can flip bits back for
 	// testing) are dev-tool noise, not player events.
@@ -507,6 +512,46 @@ func runForGame(
 			if isStillCurrent != nil && !isStillCurrent() {
 				return nil
 			}
+		}
+	}
+}
+
+// Steam can be mid-startup when a game launches (Big Picture, a shortcut
+// that starts Steam itself), so the active account may not be readable
+// for a few seconds. Retry for as long as the session lasts instead of
+// giving up on it — a one-shot read used to leave the whole session
+// unwatched: no stats file, no unlocks, no error visible to the user.
+const steamID3RetryInterval = 10 * time.Second
+
+// resolveSteamID3Blocking retries until an account resolves, the game
+// stops being the current one, or done closes. ok=false means the caller
+// should end the session quietly.
+func resolveSteamID3Blocking(
+	steamPath string,
+	done <-chan struct{},
+	isStillCurrent func() bool,
+) (steamID3 uint32, source string, ok bool) {
+	for attempt := 1; ; attempt++ {
+		id, source, err := resolveSteamID3(steamPath)
+		if err == nil {
+			if attempt > 1 {
+				logf("%s steamID3 resolved on attempt %d (%s)", stamp(), attempt, source)
+			}
+			return id, source, true
+		}
+		// First failure, then every ~5 min — enough to date the problem
+		// in a support log without flooding it.
+		if attempt == 1 || attempt%30 == 0 {
+			logf("%s resolveSteamID3: %v — retrying every %s", stamp(), err, steamID3RetryInterval)
+		}
+
+		select {
+		case <-done:
+			return 0, "", false
+		case <-time.After(steamID3RetryInterval):
+		}
+		if isStillCurrent != nil && !isStillCurrent() {
+			return 0, "", false
 		}
 	}
 }
@@ -596,13 +641,13 @@ func runDumpStats(args []string) {
 		}
 	}
 
-	steamID3, err := readCurrentSteamID3(steamPath)
+	steamID3, idSource, err := resolveSteamID3(steamPath)
 	if err != nil {
-		log.Fatalf("dump-stats: readCurrentSteamID3: %v", err)
+		log.Fatalf("dump-stats: resolveSteamID3: %v", err)
 	}
 
 	fmt.Printf("steam-path : %s\n", steamPath)
-	fmt.Printf("steamID3   : %d (steamID64 %d)\n", steamID3, steamID64FromAccountID(steamID3))
+	fmt.Printf("steamID3   : %d (steamID64 %d) via %s\n", steamID3, steamID64FromAccountID(steamID3), idSource)
 	fmt.Printf("appid      : %d\n", appid)
 	fmt.Printf("schema     : %s\n", schemaCachePath(steamPath, appid))
 	fmt.Printf("stats      : %s\n\n", statsCachePath(steamPath, steamID3, appid))
