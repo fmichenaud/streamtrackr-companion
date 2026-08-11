@@ -138,10 +138,13 @@ func runWatcher() {
 	// tray" branches and lets a tray-style re-auth (none in CLI today,
 	// but cheap to support) work end-to-end.
 	setBackend(*backendF)
-	setToken(*tokenF)
+	applyToken(*tokenF)
 	if *tokenF != "" {
 		logf("  backend : %s (push enabled)", *backendF)
-		state.setAuthenticated(true)
+		// The watchdog matters in CLI mode too — that's where support
+		// sessions happen, and "health: green → red" in the log is the
+		// fastest answer to "is this client still sending?".
+		go runHealthMonitor(nil)
 	} else {
 		logf("  backend : -- (diagnostic mode, no HTTP push)")
 	}
@@ -183,10 +186,9 @@ func runWatcherLoopForTray(done <-chan struct{}) {
 	token := envOr("STREAMTRACKR_TOKEN", storedToken)
 
 	setBackend(backend)
-	setToken(token)
+	applyToken(token)
 
 	state.setMode("auto")
-	state.setAuthenticated(token != "")
 
 	if token == "" {
 		token = ensureAuthenticated(backend, done)
@@ -196,8 +198,7 @@ func runWatcherLoopForTray(done <-chan struct{}) {
 				return
 			}
 		}
-		setToken(token)
-		state.setAuthenticated(true)
+		applyToken(token)
 	}
 
 	if s := state.snapshot(); s.UserEmail == "" && s.UserDisplayName == "" {
@@ -211,9 +212,14 @@ func runWatcherLoopForTray(done <-chan struct{}) {
 // pairing, and returns the freshly minted token (or "" on refusal /
 // timeout). done is honoured at every blocking step.
 func ensureAuthenticated(backend string, done <-chan struct{}) string {
-	if !showWelcomeDialog() {
-		logf("welcome: user dismissed — waiting for a manual re-pair")
-		return ""
+	// Show the welcome dialog at most once per process. The watcher is
+	// supervised now, so a panic-restart must not pop a dialog every
+	// few seconds.
+	if !welcomeShown.Swap(true) {
+		if !showWelcomeDialog() {
+			logf("welcome: user dismissed — waiting for a manual re-pair")
+			return ""
+		}
 	}
 	frontend := envOr("STREAMTRACKR_FRONTEND", defaultFrontend)
 	// Same convention as deriveFrontendURL — api.X.com → X.com — when
@@ -298,6 +304,10 @@ func stripAPISubdomain(backend string) string {
 var (
 	backendFlag atomic.Pointer[string]
 	tokenFlag   atomic.Pointer[string]
+
+	// welcomeShown guards the first-run dialog against the supervisor
+	// restarting the watcher.
+	welcomeShown atomic.Bool
 )
 
 func currentBackend() string {
@@ -315,25 +325,81 @@ func currentToken() string {
 }
 
 func setBackend(v string) { backendFlag.Store(&v) }
-func setToken(v string)   { tokenFlag.Store(&v) }
+
+// applyToken is the ONLY way to change the token. It moves the
+// in-memory token and the flag the UI reads together, because letting
+// them drift apart is precisely what broke: a re-pair updated the UI
+// flag and not the token, so the tray showed a signed-in companion
+// while every request path short-circuited on an empty token. The
+// result was a green dot and total silence — no requests, no log lines,
+// for as long as the app stayed open.
+func applyToken(v string) {
+	tokenFlag.Store(&v)
+	state.setAuthenticated(v != "")
+}
+
+// Heartbeat cadence. A companion that is being refused (401/403) must
+// not keep asking once a minute forever — that was 1 500 to 3 000
+// pointless requests a day per blocked client, and it told the user
+// nothing. Back off exponentially, cap at 15 min, and let the dot and
+// the log carry the message instead.
+const (
+	heartbeatInterval    = 60 * time.Second
+	heartbeatMaxInterval = 15 * time.Minute
+	heartbeatMaxShift    = 8
+)
+
+func heartbeatBackoff(consecutiveBlocks int) time.Duration {
+	if consecutiveBlocks <= 0 {
+		return heartbeatInterval
+	}
+	if consecutiveBlocks > heartbeatMaxShift {
+		consecutiveBlocks = heartbeatMaxShift
+	}
+	d := heartbeatInterval << uint(consecutiveBlocks)
+	if d > heartbeatMaxInterval {
+		return heartbeatMaxInterval
+	}
+	return d
+}
+
+func heartbeatDue(lastAttempt time.Time) bool {
+	return time.Since(lastAttempt) >= heartbeatBackoff(state.snapshot().TransportBlocks)
+}
 
 // runAutoMode reads RunningAppID, hands the appid to runForGame, and
 // loops on game changes. Backend /current-game is a fallback when the
-// registry read fails; pinged once a minute regardless to keep the
-// server-side companion heartbeat alive. Token + backend are read from
-// the atomic globals on every call so a mid-session re-login or logout
-// from the tray menu takes effect immediately.
+// registry read fails; it is also pinged once a minute regardless (less
+// often when the API is refusing us — see heartbeatBackoff) to keep the
+// server-side companion heartbeat alive and to prove to the watchdog
+// that this client is still talking. Token + backend are read from the
+// atomic globals on every call so a mid-session re-login or logout from
+// the tray menu takes effect immediately.
 func runAutoMode(detectInterval, poll time.Duration, done <-chan struct{}) {
 	logf("%s waiting for a Steam game…", stamp())
 
-	const heartbeatInterval = 60 * time.Second
-	lastHeartbeat := time.Time{}
+	var (
+		lastHeartbeatAttempt time.Time
+		heartbeatInFlight    atomic.Bool
+	)
+	// lastHeartbeatAttempt throttles *sending*; it says nothing about
+	// whether anyone answered. Liveness lives in the shared state, fed
+	// by pollCurrentGame itself, and is judged by runHealthMonitor on a
+	// goroutine this loop can't take down with it.
 	pingHeartbeat := func() {
-		if time.Since(lastHeartbeat) < heartbeatInterval {
+		if !heartbeatDue(lastHeartbeatAttempt) {
 			return
 		}
-		go pollCurrentGame(currentBackend(), currentToken())
-		lastHeartbeat = time.Now()
+		// One in flight at a time: a stalled request must not queue up
+		// behind itself while the 5 s timeout runs down.
+		if !heartbeatInFlight.CompareAndSwap(false, true) {
+			return
+		}
+		lastHeartbeatAttempt = time.Now()
+		go func() {
+			defer heartbeatInFlight.Store(false)
+			pollCurrentGame(currentBackend(), currentToken())
+		}()
 	}
 
 	for {
@@ -349,9 +415,22 @@ func runAutoMode(detectInterval, poll time.Duration, done <-chan struct{}) {
 
 		appid, name, localErr := detectLocalGame()
 		if localErr != nil {
-			logf("local detect failed (%v) — falling back to /current-game", localErr)
+			// The backend fallback used to fire on every 5 s tick here,
+			// which is how an unreadable registry (or a permanent 403)
+			// turned into a request storm. Rate-limit it like the
+			// heartbeat, and keep the last known game while throttled
+			// rather than flapping the UI to "no game".
+			if !heartbeatDue(lastHeartbeatAttempt) {
+				select {
+				case <-done:
+					return
+				case <-time.After(detectInterval):
+					continue
+				}
+			}
+			logf("%s local detect failed (%v) — falling back to /current-game", stamp(), localErr)
+			lastHeartbeatAttempt = time.Now()
 			appid, name = pollCurrentGame(currentBackend(), currentToken())
-			lastHeartbeat = time.Now()
 		} else {
 			pingHeartbeat()
 		}
@@ -369,13 +448,22 @@ func runAutoMode(detectInterval, poll time.Duration, done <-chan struct{}) {
 		state.setGame(appid, name, 0, 0)
 
 		sessionAppid := appid
+		registryErrors := 0
 		isStillCurrent := func() bool {
 			pingHeartbeat()
 			cur, _, err := detectLocalGame()
 			if err != nil {
-				// Transient registry error — be optimistic, next tick retries.
+				// Transient registry error — be optimistic, next tick
+				// retries. But "optimistic forever" is how a session
+				// outlives its game, so say something once it stops
+				// looking transient (~1 min at the 4 s alive tick).
+				registryErrors++
+				if registryErrors == 15 {
+					logf("%s registry unreadable for ~1 min (%v) — still assuming appid %d is running", stamp(), err, sessionAppid)
+				}
 				return true
 			}
+			registryErrors = 0
 			return cur == sessionAppid
 		}
 		_ = runForGame(appid, poll, isStillCurrent, done)
@@ -402,15 +490,23 @@ func runForGame(
 	isStillCurrent func() bool,
 	done <-chan struct{},
 ) error {
+	// Every early exit below leaves the session running while watching
+	// nothing. Each one used to be a log line and a green dot; they are
+	// now in the state, because "no achievement will ever be detected"
+	// is exactly as fatal to the user as a 403.
+	defer state.clearCaptureError()
+
 	steamPath, err := readSteamPath()
 	if err != nil {
 		logf("%s readSteamPath: %v — can't watch achievements without a Steam install", stamp(), err)
+		state.setCaptureError("can't find your Steam install — achievements aren't being watched")
 		return waitUntilDoneOrInactive(done, isStillCurrent)
 	}
 	steamID3, idSource, ok := resolveSteamID3Blocking(steamPath, done, isStillCurrent)
 	if !ok {
 		return nil
 	}
+	state.clearCaptureError()
 
 	// Schema file may arrive a few seconds after game launch if Steam
 	// hasn't cached it yet — retry once before giving up.
@@ -425,10 +521,12 @@ func runForGame(
 		slots, err = readSchema(steamPath, appid)
 		if err != nil {
 			logf("%s readSchema(%d) retry failed: %v", stamp(), appid, err)
+			state.setCaptureError("Steam hasn't cached this game's achievements — restart the game to fix")
 			return waitUntilDoneOrInactive(done, isStillCurrent)
 		}
 	}
 	if len(slots) == 0 {
+		// Not a failure: plenty of games ship without achievements.
 		logf("%s appid %d has no achievements in schema", stamp(), appid)
 		return waitUntilDoneOrInactive(done, isStillCurrent)
 	}
@@ -456,9 +554,14 @@ func runForGame(
 	logf("%s watching %s", stamp(), statsPath)
 	// A missing stats file is normal before the first StoreStats, but
 	// paired with a guessed account it's the fingerprint of having picked
-	// the wrong one — say so in the log rather than sitting silent.
-	if _, err := os.Stat(statsPath); os.IsNotExist(err) && idSource != "registry ActiveUser" {
-		logf("%s note: no stats file yet for this account — expected if the game was never played on it", stamp())
+	// the wrong one — say so in the log rather than sitting silent. Log
+	// it either way: which account answered is the first thing support
+	// needs, and the old `idSource != registry` condition hid the note
+	// exactly when the account came from the source we trust most.
+	statsFileMissing := false
+	if _, err := os.Stat(statsPath); os.IsNotExist(err) {
+		statsFileMissing = true
+		logf("%s note: no stats file yet (account from %s) — expected if this game was never played on it", stamp(), idSource)
 	}
 
 	// Only push 0→1 transitions. Re-locks (SAM can flip bits back for
@@ -479,7 +582,7 @@ func runForGame(
 				// Read token+backend fresh so a mid-session re-login
 				// from the tray takes effect on the very next push.
 				// Display name is resolved server-side from the Web API.
-				go pushUnlock(currentBackend(), currentToken(), appid, apiName, "")
+				go pushUnlock(currentBackend(), currentToken(), appid, apiName, "", done)
 			}
 		}
 		prev = next
@@ -502,7 +605,20 @@ func runForGame(
 		case <-statsTick.C:
 			fi, err := os.Stat(statsPath)
 			if err != nil {
+				// Silent `continue` here means we can poll a file that
+				// will never exist for the entire session and never say
+				// so. Log the appear/disappear transitions — at 250 ms
+				// a per-tick log would be unusable, but a transition is
+				// one line and answers "was it ever there?".
+				if !statsFileMissing {
+					statsFileMissing = true
+					logf("%s stats file went away (%v) — waiting for it to come back", stamp(), err)
+				}
 				continue
+			}
+			if statsFileMissing {
+				statsFileMissing = false
+				logf("%s stats file is there now — watching for unlocks", stamp())
 			}
 			if !fi.ModTime().Equal(lastMod) {
 				lastMod = fi.ModTime()
@@ -544,6 +660,10 @@ func resolveSteamID3Blocking(
 		if attempt == 1 || attempt%30 == 0 {
 			logf("%s resolveSteamID3: %v — retrying every %s", stamp(), err, steamID3RetryInterval)
 		}
+		// Retrying quietly still means zero achievements detected for as
+		// long as it lasts. Put it in front of the user instead of only
+		// in the log.
+		state.setCaptureError("can't tell which Steam account is signed in — achievements aren't being watched")
 
 		select {
 		case <-done:
@@ -559,22 +679,29 @@ func resolveSteamID3Blocking(
 // waitUntilDoneOrInactive blocks until done closes or isStillCurrent
 // goes false. Used by runForGame's early-exit paths.
 func waitUntilDoneOrInactive(done <-chan struct{}, isStillCurrent func() bool) error {
-	if isStillCurrent == nil {
-		if done == nil {
-			select {}
-		}
-		<-done
-		return nil
-	}
 	t := time.NewTicker(4 * time.Second)
 	defer t.Stop()
+	// Parked sessions are the quietest failure mode in the app: nothing
+	// is being watched and nothing says so. The state carries the
+	// reason (see the capture errors above); this reminder dates it in
+	// the log every 5 min so a support tail can't mistake a parked
+	// session for a working one.
+	const remindEvery = 5 * time.Minute
+	lastReminder := time.Now()
+
 	for {
 		select {
 		case <-done:
 			return nil
 		case <-t.C:
-			if !isStillCurrent() {
+			if isStillCurrent != nil && !isStillCurrent() {
 				return nil
+			}
+			if time.Since(lastReminder) >= remindEvery {
+				lastReminder = time.Now()
+				if capture := state.snapshot().CaptureError; capture != "" {
+					logf("%s still parked: %s", stamp(), capture)
+				}
 			}
 		}
 	}

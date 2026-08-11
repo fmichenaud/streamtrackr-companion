@@ -147,19 +147,3 @@ func computeUnlocked(slots []achievementSlot, stats map[uint32]int32) map[string
 	}
 	return out
 }
-
-// readAchievementState wraps readSchema + readUserStats + computeUnlocked.
-func readAchievementState(steamPath string, steamID3 uint32, appid uint32) (map[string]bool, error) {
-	slots, err := readSchema(steamPath, appid)
-	if err != nil {
-		return nil, fmt.Errorf("schema: %w", err)
-	}
-	if len(slots) == 0 {
-		return map[string]bool{}, nil
-	}
-	stats, err := readUserStats(steamPath, steamID3, appid)
-	if err != nil {
-		return nil, fmt.Errorf("stats: %w", err)
-	}
-	return computeUnlocked(slots, stats), nil
-}

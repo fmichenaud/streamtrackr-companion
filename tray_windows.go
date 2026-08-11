@@ -73,10 +73,14 @@ func onTrayReady() {
 	itemQuit = systray.AddMenuItem("Quit", "Stop the companion and exit")
 
 	watcherDone = make(chan struct{})
-	go runWatcherLoopForTray(watcherDone)
+	// Supervised: if the watcher panics or returns while the app is
+	// still up, it comes back and the log says so. An unsupervised
+	// watcher that stops is indistinguishable from a working one.
+	supervise("watcher", watcherDone, func() { runWatcherLoopForTray(watcherDone) })
 	startAutoUpdater(6*time.Hour, watcherDone)
-	go refreshMenuLoop()
-	go handleMenuEvents()
+	supervise("health monitor", watcherDone, func() { runHealthMonitor(watcherDone) })
+	supervise("menu refresh", watcherDone, refreshMenuLoop)
+	supervise("menu events", watcherDone, handleMenuEvents)
 }
 
 func onTrayExit() {
@@ -114,14 +118,20 @@ func updateMenuFromState() {
 		itemRestart.Show()
 	}
 
-	// Icon priority: error trumps "no game" — push failures are
-	// more actionable than waiting state.
+	// The dot follows health(), which is about delivery — whether what
+	// we send is being accepted — and not about whether a token exists.
+	// The old icon logic answered "am I connected", which is the
+	// question that made three different outages look identical.
+	level, label := s.health(time.Now())
+
 	var next []byte
 	switch {
-	case !s.Authenticated:
+	case level == healthRed && !s.Authenticated:
 		next = iconOffline
-	case s.LastPushError != "":
+	case level == healthRed:
 		next = iconError
+	case level == healthAmber:
+		next = iconWarn
 	case s.CurrentAppID == 0:
 		next = iconIdle
 	default:
@@ -132,15 +142,13 @@ func updateMenuFromState() {
 		currentIcon = next
 	}
 
-	switch {
-	case !s.Authenticated:
-		itemStatus.SetTitle("Status: not signed in (click 'Sign in again')")
-	case s.CurrentAppID == 0:
-		itemStatus.SetTitle("Status: waiting for a Steam game")
-	case s.LastPushError != "":
-		itemStatus.SetTitle("Status: ⚠ " + truncate(s.LastPushError, 60))
+	switch level {
+	case healthRed:
+		itemStatus.SetTitle("Status: ✖ " + truncate(label, 70))
+	case healthAmber:
+		itemStatus.SetTitle("Status: ⚠ " + truncate(label, 70))
 	default:
-		itemStatus.SetTitle(fmt.Sprintf("Status: active · %d unlock(s) this session", s.UnlocksPushedThisSession))
+		itemStatus.SetTitle("Status: " + truncate(label, 70))
 	}
 
 	identity := s.UserDisplayName
@@ -175,8 +183,8 @@ func updateMenuFromState() {
 		itemLastUnlock.SetTitle(fmt.Sprintf("Last achievement: %s · %s", truncate(s.LastUnlockTitle, 48), ago))
 	}
 
-	if s.LastPushError != "" {
-		systray.SetTooltip("StreamTrackr Companion — error: " + truncate(s.LastPushError, 80))
+	if level != healthGreen {
+		systray.SetTooltip("StreamTrackr Companion — " + truncate(label, 100))
 	} else if s.CurrentAppID != 0 {
 		systray.SetTooltip(fmt.Sprintf("StreamTrackr Companion — %s (%d unlocks)", s.CurrentGameName, s.UnlocksPushedThisSession))
 	} else {
@@ -187,9 +195,21 @@ func updateMenuFromState() {
 func handleMenuEvents() {
 	for {
 		select {
-		case <-itemRestart.ClickedCh:
-			restartSelf()
+		// Shutdown is a legitimate way out of this loop, and it has to
+		// be one the supervisor recognises. Without this case, quitting
+		// raced: the loop returned before watcherDone was closed, the
+		// supervisor read that as a crash, and the restarted loop then
+		// read the already-closed ClickedCh channels and re-triggered
+		// the whole teardown.
+		case <-watcherDone:
 			return
+		case <-itemRestart.ClickedCh:
+			// On success this never returns. On failure it must NOT end
+			// the loop: returning here left the whole menu inert —
+			// Quit included — with nothing said about it.
+			if err := restartSelf(); err != nil {
+				logf("restart: %v — companion left running", err)
+			}
 		case <-itemDashboard.ClickedCh:
 			_ = openBrowser(deriveFrontendURL(currentBackend()) + "/dashboard")
 		case <-itemRelogin.ClickedCh:
@@ -202,7 +222,12 @@ func handleMenuEvents() {
 					return
 				}
 				if t, _, err := loadToken(); err == nil && t != "" {
-					state.setAuthenticated(true)
+					// applyToken, not setAuthenticated: this line used to
+					// update the UI flag only, leaving the watcher on the
+					// old (or empty) token. That is the bug that produced
+					// a green dot and zero requests, indefinitely.
+					applyToken(t)
+					logf("re-login: token applied — pushes resume with the new token")
 					go refreshIdentity(backend, t)
 				}
 			}()
@@ -216,15 +241,17 @@ func handleMenuEvents() {
 				if err := clearToken(); err != nil {
 					logf("logout: clearToken failed: %v", err)
 				}
-				state.setAuthenticated(false)
+				applyToken("")
 				state.setIdentity("", "")
-				setToken("")
 			}()
 		case <-itemCheckUpd.ClickedCh:
 			go runManualUpdateCheck()
 		case <-itemAutostart.ClickedCh:
 			toggleAutostart(itemAutostart)
 		case <-itemQuit.ClickedCh:
+			// Close done first: it tells every supervised loop —
+			// including this one — that stopping is intended.
+			stopWatcher()
 			systray.Quit()
 			return
 		}
@@ -244,20 +271,5 @@ func deriveFrontendURL(backend string) string {
 	return backend
 }
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-1] + "…"
-}
-
-func humanRelative(d time.Duration) string {
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds ago", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dmin ago", int(d.Minutes()))
-	default:
-		return fmt.Sprintf("%dh%02d ago", int(d.Hours()), int(d.Minutes())%60)
-	}
-}
+// truncate / humanRelative live in health.go — the CLI and the tests
+// need them on every platform.

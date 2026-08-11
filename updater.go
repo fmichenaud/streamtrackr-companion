@@ -31,7 +31,7 @@ const defaultManifestURL = "https://github.com/fmichenaud/streamtrackr-companion
 // Closed allowlist so a MITM can't redirect us to an unsigned binary
 // even if the manifest URL ever gets attacker-influenced.
 var allowedManifestHosts = map[string]bool{
-	"github.com":                   true,
+	"github.com":                    true,
 	"objects.githubusercontent.com": true,
 }
 
@@ -83,7 +83,9 @@ func startAutoUpdater(interval time.Duration, done <-chan struct{}) {
 		logf("updater: dev build — skipping auto-update loop.")
 		return
 	}
-	go func() {
+	// Supervised like the other long-lived loops: an updater that dies
+	// quietly means a companion that silently stops receiving fixes.
+	supervise("updater", done, func() {
 		// Initial poll after a short delay so the watcher loop has time
 		// to attach to a running game before we hog the user's bandwidth
 		// for a download.
@@ -108,7 +110,7 @@ func startAutoUpdater(interval time.Duration, done <-chan struct{}) {
 				}
 			}
 		}
-	}()
+	})
 }
 
 // fetchManifest returns (nil, nil) for empty/unparseable manifests so a
@@ -215,23 +217,24 @@ func downloadAndVerify(url, expectedHex string) ([]byte, error) {
 	return body, nil
 }
 
-// restartSelf relaunches the (now-updated) binary and exits.
-func restartSelf() {
+// restartSelf relaunches the (now-updated) binary and exits. It only
+// returns when the relaunch failed — callers must keep running in that
+// case rather than treating it as a normal exit.
+func restartSelf() error {
 	exe, err := os.Executable()
 	if err != nil {
-		logf("restart: Executable(): %v", err)
-		return
+		return fmt.Errorf("Executable(): %w", err)
 	}
 	cmd := exec.Command(exe)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		logf("restart: Start(): %v", err)
-		return
+		return fmt.Errorf("Start(): %w", err)
 	}
 	logf("restart: relaunched as pid=%d — exiting current process.", cmd.Process.Pid)
 	os.Exit(0)
+	return nil // unreachable
 }
 
 // isNewer compares plain semver triplets (no pre-release / metadata).

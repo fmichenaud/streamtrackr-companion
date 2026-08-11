@@ -14,11 +14,18 @@ import (
 
 // Status icon variants, generated at init() by overlaying a coloured
 // dot on the embedded base ICO. Tailwind palette: slate-400 (offline),
-// blue-500 (idle), green-500 (active), red-500 (error).
+// blue-500 (idle), green-500 (active), amber-500 (delivering nowhere),
+// red-500 (error).
+//
+// Amber exists because "we're talking to the API but nothing we send
+// lands" needs to be distinguishable at a glance from both "all good"
+// and "offline" — it is the state the old two-colour scheme rendered as
+// success.
 var (
 	iconOffline []byte
 	iconIdle    []byte
 	iconActive  []byte
+	iconWarn    []byte
 	iconError   []byte
 )
 
@@ -29,6 +36,7 @@ func init() {
 		iconOffline = trayIcon
 		iconIdle = trayIcon
 		iconActive = trayIcon
+		iconWarn = trayIcon
 		iconError = trayIcon
 		return
 	}
@@ -41,6 +49,7 @@ func init() {
 		{"offline", color.RGBA{0x9C, 0xA3, 0xAF, 0xFF}, &iconOffline},
 		{"idle", color.RGBA{0x3B, 0x82, 0xF6, 0xFF}, &iconIdle},
 		{"active", color.RGBA{0x22, 0xC5, 0x5E, 0xFF}, &iconActive},
+		{"warn", color.RGBA{0xF5, 0x9E, 0x0B, 0xFF}, &iconWarn},
 		{"error", color.RGBA{0xEF, 0x44, 0x44, 0xFF}, &iconError},
 	}
 	for _, s := range statusColors {

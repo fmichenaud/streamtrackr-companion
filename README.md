@@ -17,8 +17,12 @@ End-to-end latency from achievement unlock to your stream overlay:
 - On a new unlock, posts the event to the StreamTrackr backend over
   HTTPS, which fans it out to your overlay (SSE), Twitch chat, Discord
   webhooks, session stats and goals.
-- Runs quietly in the Windows tray with a status icon that reflects what
-  it's doing (signed in, waiting for a game, actively tracking, error).
+- Runs quietly in the Windows tray with a status icon that reflects
+  whether your achievements are actually being *delivered* — green when
+  the last push was accepted, amber when StreamTrackr has nowhere to put
+  it (no overlay open, tracker on another platform or another game), red
+  when nothing can arrive at all (signed out, subscription inactive, or
+  no reply from the API for several minutes).
 - Auto-updates itself in the background — new versions are downloaded,
   SHA-256-verified, and applied on the next restart.
 
@@ -168,7 +172,8 @@ access to as your own user.
 ├── kv_binary.go             Valve BinaryKV (binary VDF) parser
 ├── steam_user.go            Active steamID3: registry → loginusers.vdf → userdata
 ├── stats_reader.go          Schema + user-stats cache reader + bitmask math
-├── stats_watcher.go         mtime polling primitive
+├── app_state.go             Shared state: transport / delivery / capture
+├── health.go                Dot colour + watchdog + goroutine supervisor
 ├── assets/icon.ico          Tray + window icon (multi-res 16/32/48)
 ├── installer/installer.nsi  NSIS Modern UI installer (per-user, no UAC)
 └── .github/workflows/       CI: builds + publishes a release on tag push
@@ -197,6 +202,31 @@ Total: 12/47 unlocked
 
 If anything mismatches what Steam's own UI shows, file an issue — that's
 the regression surface we care about most.
+
+### Reading a user's log
+
+The log lives at `%AppData%\StreamTrackr\companion.log` (rotated at
+5 MiB, one backup). Every API interaction is one greppable line, so
+"is this companion actually sending anything?" is answerable from the
+log alone:
+
+```
+grep ' unlock '       # every push, with the API's verdict
+grep 'current-game'   # the once-a-minute heartbeat
+grep 'health:'        # every green/amber/red transition
+```
+
+```
+unlock appid=346900 api="ACH_VETERAN" attempt=1/3 http=200 status=injected reason=- tracker=abc → green
+unlock appid=346900 api="ACH_VETERAN" attempt=1/3 http=200 status=no_tracker reason=other_platform tracker=- → amber
+unlock appid=346900 api="ACH_VETERAN" attempt=1/3 http=403 code=PRO_LICENSE_EXPIRED msg="your Pro subscription has expired"
+current-game http=200 appid=346900
+current-game skipped=no-token
+health: green → red — your Pro subscription has expired
+```
+
+`status=-` or `reason=-` means the server didn't send that field; the
+companion treats it as "unknown", never as an error.
 
 ## Security notes
 
