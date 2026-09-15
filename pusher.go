@@ -51,7 +51,9 @@ type apiError struct {
 // idempotent (it answers already_unlocked), so a retry can't duplicate;
 // but a durable queue would replay yesterday's achievements after a
 // restart, which is worse than losing one.
-const (
+// var, not const, so a test can exercise the retry loop without sleeping
+// through the real backoff. Nothing outside tests writes them.
+var (
 	pushAttempts       = 3
 	pushRetryDelay     = 3 * time.Second
 	baselineRetryDelay = 8 * time.Second
@@ -64,21 +66,85 @@ type pushOutcome struct {
 	delay     time.Duration
 }
 
+// postError carries which step failed, so the log line stays as precise
+// as it was when each push wrote its own transport code.
+type postError struct {
+	stage string // "marshal", "request" or "network"
+	err   error
+}
+
+func (e postError) Error() string { return e.err.Error() }
+
+// postJSON is the transport every push shares: marshal, authenticated
+// POST with a 5 s budget, read a bounded body. It deliberately knows
+// nothing about statuses — each endpoint classifies its own answers,
+// which is where they legitimately differ (relock forgives a 404 from a
+// server that predates it; unlock must not, since /steam/unlock has
+// shipped for ages and a 404 there means something is actually wrong
+// with the route).
+func postJSON(backend, token, path string, payload any) (statusCode int, body []byte, err error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, postError{stage: "marshal", err: err}
+	}
+
+	url := strings.TrimRight(backend, "/") + path
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return 0, nil, postError{stage: "request", err: err}
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "streamtrackr-companion/"+version)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, postError{stage: "network", err: err}
+	}
+	defer resp.Body.Close()
+	body, _ = io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, body, nil
+}
+
 // pushUnlock POSTs an unlock event, retrying a bounded number of times
 // on failures that a retry can fix (network, 5xx, 429) and on
 // no_baseline, which explicitly means "the tracker is still starting,
 // try later". Runs on its own goroutine; done aborts the backoff so a
 // quit isn't held up by a pending retry.
-func pushUnlock(backend, token string, appid uint32, apiName, displayName string, done <-chan struct{}) {
+//
+// cancel aborts it for a different reason: this very achievement has been
+// re-locked on the player's machine while we were retrying. Delivering it
+// now would announce a trophy the player just erased and leave the server
+// unlocked against a locked Steam — see {@link inflightUnlocks}. Checked
+// before every attempt, not only during the backoff, because a push that
+// has not gone out yet is precisely the one worth stopping. A nil channel
+// never cancels.
+func pushUnlock(backend, token string, appid uint32, apiName, displayName string, done, cancel <-chan struct{}) {
 	for attempt := 1; ; attempt++ {
+		select {
+		case <-cancel:
+			logf("unlock appid=%d api=%q cancelled=relocked attempt=%d/%d", appid, apiName, attempt, pushAttempts)
+			return
+		case <-done:
+			return
+		default:
+		}
 		outcome := pushUnlockOnce(backend, token, appid, apiName, displayName, attempt)
 		if !outcome.retryable || attempt >= pushAttempts {
 			if outcome.retryable {
+				// No recordSoftError here: whatever made the last attempt
+				// retryable already recorded its own, more precise label.
 				logf("unlock appid=%d api=%q gave up after %d attempts", appid, apiName, pushAttempts)
 			}
 			return
 		}
 		select {
+		case <-cancel:
+			logf("unlock appid=%d api=%q cancelled=relocked attempt=%d/%d", appid, apiName, attempt, pushAttempts)
+			return
 		case <-done:
 			return
 		case <-time.After(outcome.delay):
@@ -95,7 +161,7 @@ func pushUnlockOnce(backend, token string, appid uint32, apiName, displayName st
 		logf("unlock appid=%d api=%q skipped=no-token", appid, apiName)
 		return pushOutcome{}
 	}
-	body, err := json.Marshal(unlockPayload{
+	status, respBody, err := postJSON(backend, token, "/api/companion/steam/unlock", unlockPayload{
 		AppID: appid,
 		Achievement: achievementInfo{
 			APIName:     apiName,
@@ -103,44 +169,28 @@ func pushUnlockOnce(backend, token string, appid uint32, apiName, displayName st
 		},
 	})
 	if err != nil {
-		logf("unlock appid=%d api=%q error=marshal msg=%q", appid, apiName, err.Error())
-		return pushOutcome{}
-	}
-
-	url := strings.TrimRight(backend, "/") + "/api/companion/steam/unlock"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		logf("unlock appid=%d api=%q error=request msg=%q", appid, apiName, err.Error())
-		return pushOutcome{}
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "streamtrackr-companion/"+version)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
+		pe, _ := err.(postError)
+		if pe.stage != "network" {
+			logf("unlock appid=%d api=%q error=%s msg=%q", appid, apiName, pe.stage, err.Error())
+			return pushOutcome{}
+		}
 		logf("unlock appid=%d api=%q attempt=%d/%d error=network msg=%q",
 			appid, apiName, attempt, pushAttempts, err.Error())
 		state.recordSoftError("network error reaching StreamTrackr")
 		return pushOutcome{retryable: true, delay: pushRetryDelay}
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 
-	if resp.StatusCode != http.StatusOK {
-		label, blocked := classifyHTTPError(resp.StatusCode, respBody)
+	if status != http.StatusOK {
+		label, blocked := classifyHTTPError(status, respBody)
 		logf("unlock appid=%d api=%q attempt=%d/%d http=%d code=%s msg=%q",
-			appid, apiName, attempt, pushAttempts, resp.StatusCode,
+			appid, apiName, attempt, pushAttempts, status,
 			orDash(parseAPIError(respBody).Code), label)
 		if blocked {
 			state.recordTransportBlock(label)
 			return pushOutcome{}
 		}
 		state.recordSoftError(label)
-		return pushOutcome{retryable: retryableStatus(resp.StatusCode), delay: pushRetryDelay}
+		return pushOutcome{retryable: retryableStatus(status), delay: pushRetryDelay}
 	}
 
 	// The API answered and accepted us: the watchdog is satisfied even
@@ -158,6 +208,97 @@ func pushUnlockOnce(backend, token string, appid uint32, apiName, displayName st
 		return pushOutcome{retryable: true, delay: baselineRetryDelay}
 	}
 	return pushOutcome{}
+}
+
+// relockPayload mirrors SteamRelockDto in api-nestjs/src/companion/dto.
+type relockPayload struct {
+	AppID    uint32   `json:"appId"`
+	APINames []string `json:"apiNames"`
+}
+
+// pushRelock POSTs achievements that went from unlocked to locked, with
+// the same bounded retries as pushUnlock. Idempotent server-side: a
+// relock of something already locked is a no-op.
+func pushRelock(backend, token string, appid uint32, apiNames []string, done <-chan struct{}) {
+	for attempt := 1; ; attempt++ {
+		outcome := pushRelockOnce(backend, token, appid, apiNames, attempt)
+		if !outcome.retryable || attempt >= pushAttempts {
+			if outcome.retryable {
+				logf("relock appid=%d count=%d gave up after %d attempts", appid, len(apiNames), pushAttempts)
+				// A reset is something the streamer did on purpose, between
+				// two attempts, and is watching for. Giving up on it used to
+				// be a log line and a green dot: the overlay kept the old run
+				// and nothing said why.
+				state.recordSoftError("StreamTrackr couldn't apply your achievement reset — it may still show the old run")
+			}
+			return
+		}
+		select {
+		case <-done:
+			return
+		case <-time.After(outcome.delay):
+		}
+	}
+}
+
+func pushRelockOnce(backend, token string, appid uint32, apiNames []string, attempt int) pushOutcome {
+	if token == "" {
+		logf("relock appid=%d count=%d skipped=no-token", appid, len(apiNames))
+		return pushOutcome{}
+	}
+	status, respBody, err := postJSON(backend, token, "/api/companion/steam/relock",
+		relockPayload{AppID: appid, APINames: apiNames})
+	if err != nil {
+		pe, _ := err.(postError)
+		if pe.stage != "network" {
+			logf("relock appid=%d error=%s msg=%q", appid, pe.stage, err.Error())
+			return pushOutcome{}
+		}
+		logf("relock appid=%d attempt=%d/%d error=network msg=%q", appid, attempt, pushAttempts, err.Error())
+		state.recordSoftError("network error reaching StreamTrackr")
+		return pushOutcome{retryable: true, delay: pushRetryDelay}
+	}
+
+	if status == http.StatusNotFound {
+		// A server that predates relocks. Nothing the streamer can act
+		// on, so it must not turn the tray amber. Deliberately NOT shared
+		// with pushUnlockOnce: /steam/unlock has been deployed for ages,
+		// so a 404 there is a real routing problem worth surfacing.
+		logf("relock appid=%d http=404 — server does not accept relocks yet", appid)
+		return pushOutcome{}
+	}
+	if status != http.StatusOK {
+		label, blocked := classifyHTTPError(status, respBody)
+		logf("relock appid=%d attempt=%d/%d http=%d code=%s msg=%q",
+			appid, attempt, pushAttempts, status, orDash(parseAPIError(respBody).Code), label)
+		if blocked {
+			state.recordTransportBlock(label)
+			return pushOutcome{}
+		}
+		state.recordSoftError(label)
+		return pushOutcome{retryable: retryableStatus(status), delay: pushRetryDelay}
+	}
+
+	state.recordRequestOK()
+
+	var decoded unlockResponse
+	_ = json.Unmarshal(respBody, &decoded)
+	logf("relock appid=%d count=%d attempt=%d/%d http=200 status=%s reason=%s tracker=%s",
+		appid, len(apiNames), attempt, pushAttempts,
+		orDash(decoded.Status), orDash(decoded.Reason), orDash(decoded.TrackerSlug))
+
+	if relockRetryable(decoded.Status) {
+		return pushOutcome{retryable: true, delay: pushRetryDelay}
+	}
+	return pushOutcome{}
+}
+
+// relockRetryable: only "busy" (the tracker was mid-push) can change on
+// a retry. no_tracker is not a delivery failure worth painting the tray
+// for — a reset between runs with no overlay open is ordinary, and the
+// server has already made the achievements announceable again.
+func relockRetryable(status string) bool {
+	return status == "busy"
 }
 
 // parseUnlockResponse never fails: an unparseable or empty body from an

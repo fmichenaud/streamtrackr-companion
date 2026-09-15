@@ -478,6 +478,12 @@ func runAutoMode(detectInterval, poll time.Duration, done <-chan struct{}) {
 	}
 }
 
+// How long to wait before re-reading the stats file to confirm a relock.
+// Long enough for Steam to finish an in-place rewrite, short enough that
+// a real reset still reaches the overlay while the player is still
+// looking at it.
+const relockConfirmDelay = 200 * time.Millisecond
+
 // runForGame reads the schema + stats baseline, then polls the stats
 // file's mtime for new unlocks. Returns when done closes or
 // isStillCurrent goes false. Pre-loop errors are non-fatal — log and
@@ -564,26 +570,100 @@ func runForGame(
 		logf("%s note: no stats file yet (account from %s) — expected if this game was never played on it", stamp(), idSource)
 	}
 
-	// Only push 0→1 transitions. Re-locks (SAM can flip bits back for
-	// testing) are dev-tool noise, not player events.
+	// Push 0→1 and 1→0 transitions. Re-locks used to be dropped as SAM
+	// noise, but a speedrunner clearing achievements from the Steam
+	// console between attempts produces exactly these — and without them
+	// the overlay kept the previous run's count.
 	prev := baseline
 
+	// Closed once the latest relock push is finished. Unlock pushes wait
+	// on the one current when they were detected, so an achievement
+	// earned again right after a reset can't reach the server before the
+	// reset does — it would be refused as already unlocked, then locked.
+	relockSettled := make(chan struct{})
+	close(relockSettled)
+
+	// The other direction: an unlock push already retrying when the reset
+	// happens would land AFTER the relock. Ordering it would not help —
+	// the server would still announce a trophy the player just erased —
+	// so the relock calls it off instead. Only the same achievement is a
+	// conflict, so unrelated pushes keep going in parallel.
+	inflight := newInflightUnlocks()
+
+	readUnlocks := func() (map[string]bool, error) {
+		stats, err := readExistingUserStats(steamPath, steamID3, appid)
+		if err != nil {
+			return nil, err
+		}
+		return computeUnlocked(slots, stats), nil
+	}
+
 	rescan := func() {
-		stats, err := readUserStats(steamPath, steamID3, appid)
+		next, err := readUnlocks()
 		if err != nil {
 			logf("%s    rescan stats: %v", stamp(), err)
 			return
 		}
-		next := computeUnlocked(slots, stats)
-		for apiName, isUnlocked := range next {
-			if isUnlocked && !prev[apiName] {
-				logf("%s 🏆 UNLOCKED %s", stamp(), apiName)
-				state.recordUnlock(apiName)
-				// Read token+backend fresh so a mid-session re-login
-				// from the tray takes effect on the very next push.
-				// Display name is resolved server-side from the Web API.
-				go pushUnlock(currentBackend(), currentToken(), appid, apiName, "", done)
+
+		// A relock is the one transition worth reading twice. Steam
+		// rewrites the stats file in place, so a partial write that still
+		// parses reads as achievements going away — a whole game re-locked
+		// on a hiccup, announced as a reset nobody asked for. The second
+		// read costs 200 ms on the rare rescan that sees one, and nothing
+		// at all on every other rescan.
+		if len(relockedSince(prev, next)) > 0 {
+			select {
+			case <-done:
+				return
+			case <-time.After(relockConfirmDelay):
 			}
+			confirmed, err := readUnlocks()
+			if err != nil {
+				logf("%s    relock not confirmed (%v) — leaving this rescan for the next tick", stamp(), err)
+				return
+			}
+			if !sameUnlocks(next, confirmed) {
+				logf("%s    stats file was still settling — trusting the second read", stamp())
+			}
+			next = confirmed
+		}
+
+		if relocked := relockedSince(prev, next); len(relocked) > 0 {
+			logf("%s ↺ RELOCKED %d achievement(s): %s", stamp(), len(relocked), joinNames(relocked, 10))
+			if stopped := inflight.cancel(relocked); len(stopped) > 0 {
+				logf("%s    called off %d unlock push(es) still retrying: %s", stamp(), len(stopped), joinNames(stopped, 10))
+			}
+			previous, settled := relockSettled, make(chan struct{})
+			relockSettled = settled
+			go func() {
+				defer close(settled)
+				select {
+				case <-previous:
+				case <-done:
+					return
+				}
+				pushRelock(currentBackend(), currentToken(), appid, relocked, done)
+			}()
+		}
+
+		for _, apiName := range unlockedSince(prev, next) {
+			logf("%s 🏆 UNLOCKED %s", stamp(), apiName)
+			state.recordUnlock(apiName)
+			// Read token+backend fresh so a mid-session re-login
+			// from the tray takes effect on the very next push.
+			// Display name is resolved server-side from the Web API.
+			cancel := inflight.start(apiName)
+			go func(apiName string, after <-chan struct{}, cancel chan struct{}) {
+				defer inflight.finish(apiName, cancel)
+				select {
+				case <-after:
+				case <-cancel:
+					return
+				case <-done:
+					return
+				}
+				pushUnlock(currentBackend(), currentToken(), appid, apiName, "", done, cancel)
+			}(apiName, relockSettled, cancel)
 		}
 		prev = next
 	}
