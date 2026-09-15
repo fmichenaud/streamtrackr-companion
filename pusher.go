@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -75,6 +76,17 @@ type postError struct {
 
 func (e postError) Error() string { return e.err.Error() }
 
+// asPostError keeps an error that didn't come from postJSON from reading
+// as stage "" — which logs as `error= msg=…` and, worse, takes the
+// non-retryable branch without anyone deciding that.
+func asPostError(err error) postError {
+	var pe postError
+	if errors.As(err, &pe) {
+		return pe
+	}
+	return postError{stage: "unknown", err: err}
+}
+
 // postJSON is the transport every push shares: marshal, authenticated
 // POST with a 5 s budget, read a bounded body. It deliberately knows
 // nothing about statuses — each endpoint classifies its own answers,
@@ -123,10 +135,13 @@ func postJSON(backend, token, path string, payload any) (statusCode int, body []
 // has not gone out yet is precisely the one worth stopping. A nil channel
 // never cancels.
 func pushUnlock(backend, token string, appid uint32, apiName, displayName string, done, cancel <-chan struct{}) {
+	cancelled := func(attempt int) {
+		logf("unlock appid=%d api=%q cancelled=relocked attempt=%d/%d", appid, apiName, attempt, pushAttempts)
+	}
 	for attempt := 1; ; attempt++ {
 		select {
 		case <-cancel:
-			logf("unlock appid=%d api=%q cancelled=relocked attempt=%d/%d", appid, apiName, attempt, pushAttempts)
+			cancelled(attempt)
 			return
 		case <-done:
 			return
@@ -143,7 +158,7 @@ func pushUnlock(backend, token string, appid uint32, apiName, displayName string
 		}
 		select {
 		case <-cancel:
-			logf("unlock appid=%d api=%q cancelled=relocked attempt=%d/%d", appid, apiName, attempt, pushAttempts)
+			cancelled(attempt)
 			return
 		case <-done:
 			return
@@ -169,7 +184,7 @@ func pushUnlockOnce(backend, token string, appid uint32, apiName, displayName st
 		},
 	})
 	if err != nil {
-		pe, _ := err.(postError)
+		pe := asPostError(err)
 		if pe.stage != "network" {
 			logf("unlock appid=%d api=%q error=%s msg=%q", appid, apiName, pe.stage, err.Error())
 			return pushOutcome{}
@@ -249,7 +264,7 @@ func pushRelockOnce(backend, token string, appid uint32, apiNames []string, atte
 	status, respBody, err := postJSON(backend, token, "/api/companion/steam/relock",
 		relockPayload{AppID: appid, APINames: apiNames})
 	if err != nil {
-		pe, _ := err.(postError)
+		pe := asPostError(err)
 		if pe.stage != "network" {
 			logf("relock appid=%d error=%s msg=%q", appid, pe.stage, err.Error())
 			return pushOutcome{}

@@ -319,7 +319,9 @@ func TestPushUnlockWithoutCancelStillRetries(t *testing.T) {
 	}
 }
 
-// A relock of another achievement must not touch this push.
+// A reset the streamer asked for, dropped after three tries, used to be a
+// log line behind a green dot: `busy` answers 200, which clears the soft
+// error, so nothing on screen said the overlay was still on the old run.
 func TestPushRelockGivingUpTellsTheUser(t *testing.T) {
 	shortRetries(t)
 	srv, hits := countingServer(t, 200, `{"status":"busy"}`)
@@ -333,8 +335,6 @@ func TestPushRelockGivingUpTellsTheUser(t *testing.T) {
 	if got := atomic.LoadInt32(hits); got != int32(pushAttempts) {
 		t.Errorf("made %d attempt(s), want %d", got, pushAttempts)
 	}
-	// A reset the streamer asked for, dropped silently, used to leave a
-	// green dot and an overlay still showing the old run.
 	if soft := state.snapshot().SoftError; soft == "" {
 		t.Error("giving up on a relock left no message for the user")
 	}

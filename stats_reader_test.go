@@ -462,3 +462,23 @@ func TestReadExistingUserStatsRefusesAHalfWrittenFile(t *testing.T) {
 		}
 	})
 }
+
+// The distinction the baseline read leans on: a file that isn't there is
+// "nothing unlocked yet" and reads as an empty map, while a file that is
+// there but unreadable is an error. Blur the two and a corrupt read
+// becomes an all-locked baseline, which announces the player's whole game
+// on the first rescan.
+func TestReadUserStatsSeparatesMissingFromCorrupt(t *testing.T) {
+	steamPath := t.TempDir()
+
+	stats, err := readUserStats(steamPath, 7, 440)
+	if err != nil || len(stats) != 0 {
+		t.Fatalf("a missing file should read as empty stats, got %v / %v", stats, err)
+	}
+
+	full := buildStatsBytes(1, 0b101)
+	writeStats(t, steamPath, 7, 440, full[:len(full)/2])
+	if _, err := readUserStats(steamPath, 7, 440); err == nil {
+		t.Error("a truncated file must be an error, not an empty baseline")
+	}
+}

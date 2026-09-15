@@ -478,6 +478,14 @@ func runAutoMode(detectInterval, poll time.Duration, done <-chan struct{}) {
 	}
 }
 
+// A baseline read that fails gets the same treatment as a schema read that
+// fails: Steam is often mid-write when a game starts, and a couple of
+// seconds usually settles it.
+const (
+	baselineReadAttempts = 2
+	baselineReadDelay    = 3 * time.Second
+)
+
 // How long to wait before re-reading the stats file to confirm a relock.
 // Long enough for Steam to finish an in-place rewrite, short enough that
 // a real reset still reaches the overlay while the player is still
@@ -537,10 +545,32 @@ func runForGame(
 		return waitUntilDoneOrInactive(done, isStillCurrent)
 	}
 
+	// An unreadable stats file is NOT "nothing unlocked yet". Falling back to
+	// an all-locked baseline makes the first rescan see the player's entire
+	// game go 0→1 and announce every achievement they already had — the exact
+	// mirror of the bug re-locks exist to fix. And the moment this read
+	// happens is the moment it is most likely: Steam rewrites the file as the
+	// game starts. So retry it the way readSchema is retried, and refuse to
+	// guess if it still fails. A session watched on a baseline we know is
+	// wrong is worse than a session not watched.
+	//
+	// A MISSING file is a different thing entirely and stays fine: readUserStats
+	// answers an empty map with no error, and all-locked is then the truth.
 	stats, err := readUserStats(steamPath, steamID3, appid)
+	for attempt := 1; err != nil && attempt <= baselineReadAttempts; attempt++ {
+		logf("%s readUserStats(%d): %v — retrying in %s (%d/%d)",
+			stamp(), appid, err, baselineReadDelay, attempt, baselineReadAttempts)
+		select {
+		case <-done:
+			return nil
+		case <-time.After(baselineReadDelay):
+		}
+		stats, err = readUserStats(steamPath, steamID3, appid)
+	}
 	if err != nil {
-		logf("%s readUserStats(%d): %v — treating as all-locked baseline", stamp(), appid, err)
-		stats = map[uint32]int32{}
+		logf("%s readUserStats(%d): %v — refusing to watch on a baseline that would announce the whole game", stamp(), appid, err)
+		state.setCaptureError("Steam's achievement file can't be read — achievements aren't being watched")
+		return waitUntilDoneOrInactive(done, isStillCurrent)
 	}
 	baseline := computeUnlocked(slots, stats)
 
@@ -576,19 +606,9 @@ func runForGame(
 	// the overlay kept the previous run's count.
 	prev := baseline
 
-	// Closed once the latest relock push is finished. Unlock pushes wait
-	// on the one current when they were detected, so an achievement
-	// earned again right after a reset can't reach the server before the
-	// reset does — it would be refused as already unlocked, then locked.
-	relockSettled := make(chan struct{})
-	close(relockSettled)
-
-	// The other direction: an unlock push already retrying when the reset
-	// happens would land AFTER the relock. Ordering it would not help —
-	// the server would still announce a trophy the player just erased —
-	// so the relock calls it off instead. Only the same achievement is a
-	// conflict, so unrelated pushes keep going in parallel.
-	inflight := newInflightUnlocks()
+	// Keeps unlock and relock pushes in step, per achievement name and in
+	// both directions — the reasoning is all in pushSync's doc comment.
+	pushes := newPushSync()
 
 	readUnlocks := func() (map[string]bool, error) {
 		stats, err := readExistingUserStats(steamPath, steamID3, appid)
@@ -598,12 +618,26 @@ func runForGame(
 		return computeUnlocked(slots, stats), nil
 	}
 
-	rescan := func() {
+	// Consecutive unreadable rescans, so a file that stays broken doesn't
+	// write a line every 250 ms.
+	unreadable := 0
+
+	// rescan reports whether it reached a conclusion. false means "the file
+	// was still moving" — nothing is pushed, prev is left alone, and the
+	// caller keeps lastMod so the next tick tries again. Deciding on a file
+	// that is still being written is what pushes a relock of a whole game.
+	rescan := func() bool {
 		next, err := readUnlocks()
 		if err != nil {
-			logf("%s    rescan stats: %v", stamp(), err)
-			return
+			unreadable++
+			// First failure, then every ~10 s: enough to date it in a
+			// support log without drowning it.
+			if unreadable == 1 || unreadable%40 == 0 {
+				logf("%s    rescan stats: %v", stamp(), err)
+			}
+			return false
 		}
+		unreadable = 0
 
 		// A relock is the one transition worth reading twice. Steam
 		// rewrites the stats file in place, so a partial write that still
@@ -614,58 +648,64 @@ func runForGame(
 		if len(relockedSince(prev, next)) > 0 {
 			select {
 			case <-done:
-				return
+				return false
 			case <-time.After(relockConfirmDelay):
 			}
 			confirmed, err := readUnlocks()
 			if err != nil {
-				logf("%s    relock not confirmed (%v) — leaving this rescan for the next tick", stamp(), err)
-				return
+				logf("%s    relock not confirmed (%v) — waiting for the file to settle", stamp(), err)
+				return false
 			}
+			// The two reads disagree, so the file was being written across
+			// the window. The second one is only the more recent, not the
+			// settled one — pushing a reset computed from it would be
+			// trusting the very read we just called unstable.
 			if !sameUnlocks(next, confirmed) {
-				logf("%s    stats file was still settling — trusting the second read", stamp())
+				logf("%s    stats file still settling — nothing decided this tick", stamp())
+				return false
 			}
 			next = confirmed
 		}
 
 		if relocked := relockedSince(prev, next); len(relocked) > 0 {
 			logf("%s ↺ RELOCKED %d achievement(s): %s", stamp(), len(relocked), joinNames(relocked, 10))
-			if stopped := inflight.cancel(relocked); len(stopped) > 0 {
+			if stopped := pushes.cancelUnlocks(relocked); len(stopped) > 0 {
 				logf("%s    called off %d unlock push(es) still retrying: %s", stamp(), len(stopped), joinNames(stopped, 10))
 			}
-			previous, settled := relockSettled, make(chan struct{})
-			relockSettled = settled
-			go func() {
-				defer close(settled)
-				select {
-				case <-previous:
-				case <-done:
-					return
-				}
+			settled := pushes.startRelock(relocked)
+			go func(relocked []string, settled chan struct{}) {
+				defer pushes.finishRelock(relocked, settled)
 				pushRelock(currentBackend(), currentToken(), appid, relocked, done)
-			}()
+			}(relocked, settled)
 		}
 
 		for _, apiName := range unlockedSince(prev, next) {
 			logf("%s 🏆 UNLOCKED %s", stamp(), apiName)
+			// Counted at detection, so a push later cancelled by a relock
+			// still shows here: this is "unlocks seen on this machine",
+			// which is what the tray's session list means.
 			state.recordUnlock(apiName)
 			// Read token+backend fresh so a mid-session re-login
 			// from the tray takes effect on the very next push.
 			// Display name is resolved server-side from the Web API.
-			cancel := inflight.start(apiName)
-			go func(apiName string, after <-chan struct{}, cancel chan struct{}) {
-				defer inflight.finish(apiName, cancel)
-				select {
-				case <-after:
-				case <-cancel:
-					return
-				case <-done:
-					return
+			cancel := pushes.startUnlock(apiName)
+			after := pushes.relocksFor(apiName)
+			go func(apiName string, after []chan struct{}, cancel chan struct{}) {
+				defer pushes.finishUnlock(apiName, cancel)
+				for _, relock := range after {
+					select {
+					case <-relock:
+					case <-cancel:
+						return
+					case <-done:
+						return
+					}
 				}
 				pushUnlock(currentBackend(), currentToken(), appid, apiName, "", done, cancel)
-			}(apiName, relockSettled, cancel)
+			}(apiName, after, cancel)
 		}
 		prev = next
+		return true
 	}
 
 	statsTick := time.NewTicker(poll)
@@ -700,9 +740,15 @@ func runForGame(
 				statsFileMissing = false
 				logf("%s stats file is there now — watching for unlocks", stamp())
 			}
-			if !fi.ModTime().Equal(lastMod) {
-				lastMod = fi.ModTime()
-				rescan()
+			if mod := fi.ModTime(); !mod.Equal(lastMod) {
+				// lastMod only moves on a rescan that concluded: a rescan
+				// that gave up must be retried, and this mtime was read
+				// before it (the file may have been rewritten since), so
+				// keeping the older one can only cost a harmless extra
+				// rescan — never a missed one.
+				if rescan() {
+					lastMod = mod
+				}
 			}
 		case <-aliveTick.C:
 			if isStillCurrent != nil && !isStillCurrent() {
