@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -355,4 +357,108 @@ func TestExtractSlots_NoStatsBlock(t *testing.T) {
 	if got := extractSlots(root); got != nil {
 		t.Errorf("expected nil slots from empty schema, got %v", got)
 	}
+}
+
+// ─── transitions + the reads that feed them ────────────────────────────
+
+func TestRelockedAndUnlockedSince(t *testing.T) {
+	prev := map[string]bool{"A": true, "B": false, "C": true, "D": false}
+	next := map[string]bool{"A": false, "B": true, "C": true, "D": false}
+
+	if got := relockedSince(prev, next); len(got) != 1 || got[0] != "A" {
+		t.Errorf("relockedSince = %v, want [A]", got)
+	}
+	if got := unlockedSince(prev, next); len(got) != 1 || got[0] != "B" {
+		t.Errorf("unlockedSince = %v, want [B]", got)
+	}
+}
+
+// Sorted output: a relock payload, its log line and this test must not
+// depend on Go's map iteration order.
+func TestTransitionsAreSorted(t *testing.T) {
+	prev := map[string]bool{"ZZ": true, "AA": true, "MM": true}
+	next := map[string]bool{"ZZ": false, "AA": false, "MM": false}
+
+	got := relockedSince(prev, next)
+	want := []string{"AA", "MM", "ZZ"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("relockedSince = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestSameUnlocks(t *testing.T) {
+	a := map[string]bool{"A": true, "B": false}
+	if !sameUnlocks(a, map[string]bool{"A": true, "B": false}) {
+		t.Error("identical reads should compare equal")
+	}
+	if sameUnlocks(a, map[string]bool{"A": true, "B": true}) {
+		t.Error("a changed bit should compare different")
+	}
+	if sameUnlocks(a, map[string]bool{"A": true}) {
+		t.Error("a truncated read should compare different")
+	}
+}
+
+func TestJoinNamesCapsALongList(t *testing.T) {
+	names := []string{"A", "B", "C", "D"}
+	if got := joinNames(names, 10); got != "A, B, C, D" {
+		t.Errorf("joinNames = %q", got)
+	}
+	if got := joinNames(names, 2); got != "A, B … +2 more" {
+		t.Errorf("joinNames capped = %q", got)
+	}
+}
+
+// writeStats drops a stats file where readExistingUserStats expects one.
+func writeStats(t *testing.T, steamPath string, steamID3, appid uint32, data []byte) string {
+	t.Helper()
+	path := statsCachePath(steamPath, steamID3, appid)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The three shapes Steam can leave behind mid-rewrite. Read as
+// "everything is locked", any of them would push a relock of the whole
+// game — so they have to be errors, not empty stats.
+func TestReadExistingUserStatsRefusesAHalfWrittenFile(t *testing.T) {
+	steamPath := t.TempDir()
+	full := buildStatsBytes(1, 0b101)
+
+	t.Run("valid file parses", func(t *testing.T) {
+		writeStats(t, steamPath, 7, 440, full)
+		stats, err := readExistingUserStats(steamPath, 7, 440)
+		if err != nil {
+			t.Fatalf("readExistingUserStats: %v", err)
+		}
+		if stats[1] != 0b101 {
+			t.Errorf("stat 1 = %d, want 5", stats[1])
+		}
+	})
+
+	t.Run("empty file", func(t *testing.T) {
+		writeStats(t, steamPath, 7, 440, nil)
+		if _, err := readExistingUserStats(steamPath, 7, 440); err == nil {
+			t.Error("an empty file must not read as all-locked")
+		}
+	})
+
+	t.Run("truncated file", func(t *testing.T) {
+		writeStats(t, steamPath, 7, 440, full[:len(full)/2])
+		if _, err := readExistingUserStats(steamPath, 7, 440); err == nil {
+			t.Error("a truncated file must not read as all-locked")
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		if _, err := readExistingUserStats(steamPath, 7, 999); err == nil {
+			t.Error("a file that went away must not read as all-locked")
+		}
+	})
 }

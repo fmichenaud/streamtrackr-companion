@@ -209,3 +209,26 @@ func TestKVNode_AsIntParsesStringDigits(t *testing.T) {
 		t.Errorf("AsInt of string '42': got %d, want 42", got)
 	}
 }
+
+// A file that stops inside an object it never closed is Steam caught
+// mid-rewrite. Parsing it into a partial tree is how a hiccup turns into
+// "every achievement is gone" — so it must fail. The same EOF at the top
+// level is just the end of a healthy document.
+func TestParseBinaryKV_RejectsTruncatedObject(t *testing.T) {
+	var b kvBuild
+	b.byte_(kvNone)
+	b.name("UserGameStats")
+	b.byte_(kvInt32)
+	b.name("data")
+	b.int32(5)
+	// …and the write dies here: no kvEnd for "UserGameStats".
+
+	if _, err := parseBinaryKV(b.bytes()); err == nil {
+		t.Fatal("a document truncated inside an object should not parse")
+	}
+
+	b.byte_(kvEnd) // the write completes
+	if _, err := parseBinaryKV(b.bytes()); err != nil {
+		t.Fatalf("the complete document should parse: %v", err)
+	}
+}

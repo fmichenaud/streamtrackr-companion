@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 )
 
 // Steam stores per-app achievement state in two BinaryKV files under
@@ -109,6 +111,27 @@ func readUserStats(steamPath string, steamID3 uint32, appid uint32) (map[uint32]
 	if err != nil {
 		return nil, fmt.Errorf("read user stats: %w", err)
 	}
+	return parseUserStats(data)
+}
+
+// readExistingUserStats is readUserStats for a file we just saw change.
+// There a missing or empty file is Steam mid-rewrite, not "no stats yet"
+// — and read as all-locked it would push a relock of the entire game.
+// A file truncated mid-object is refused by the parser for the same
+// reason; the caller confirms a relock against a second read on top of
+// that, for a partial write that happens to parse.
+func readExistingUserStats(steamPath string, steamID3 uint32, appid uint32) (map[uint32]int32, error) {
+	data, err := os.ReadFile(statsCachePath(steamPath, steamID3, appid))
+	if err != nil {
+		return nil, fmt.Errorf("read user stats: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("read user stats: empty file")
+	}
+	return parseUserStats(data)
+}
+
+func parseUserStats(data []byte) (map[uint32]int32, error) {
 	root, err := parseBinaryKV(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse user stats: %w", err)
@@ -146,4 +169,51 @@ func computeUnlocked(slots []achievementSlot, stats map[uint32]int32) map[string
 		out[s.APIName] = (v & (1 << s.Bit)) != 0
 	}
 	return out
+}
+
+// relockedSince / unlockedSince are the two transitions the companion
+// pushes. Sorted, so a log line, a payload and a test all read the same
+// way twice in a row — map iteration order would make all three jitter.
+func relockedSince(prev, next map[string]bool) []string {
+	var out []string
+	for apiName, isUnlocked := range next {
+		if !isUnlocked && prev[apiName] {
+			out = append(out, apiName)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func unlockedSince(prev, next map[string]bool) []string {
+	var out []string
+	for apiName, isUnlocked := range next {
+		if isUnlocked && !prev[apiName] {
+			out = append(out, apiName)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sameUnlocks reports whether two reads of the stats file agree.
+func sameUnlocks(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for apiName, isUnlocked := range a {
+		if b[apiName] != isUnlocked {
+			return false
+		}
+	}
+	return true
+}
+
+// joinNames renders achievement names for a log line, capped so a whole
+// game re-locked at once stays one readable line.
+func joinNames(names []string, max int) string {
+	if len(names) <= max {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s … +%d more", strings.Join(names[:max], ", "), len(names)-max)
 }

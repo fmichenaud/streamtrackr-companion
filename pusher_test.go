@@ -1,8 +1,13 @@
 package main
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Every status the API can answer with, plus the shapes an
@@ -208,6 +213,21 @@ func TestParseUnlockResponse(t *testing.T) {
 	}
 }
 
+// Only a tracker caught mid-push is worth asking again: a relock with no
+// overlay open is ordinary between speedrun attempts.
+func TestRelockRetryable(t *testing.T) {
+	for status, want := range map[string]bool{
+		"busy":       true,
+		"relocked":   false,
+		"no_tracker": false,
+		"":           false,
+	} {
+		if got := relockRetryable(status); got != want {
+			t.Errorf("relockRetryable(%q) = %v, want %v", status, got, want)
+		}
+	}
+}
+
 // Retrying a 403 forever is what produced thousands of daily requests;
 // retrying a network blip is what saves an achievement.
 func TestRetryableStatus(t *testing.T) {
@@ -222,5 +242,162 @@ func TestRetryableStatus(t *testing.T) {
 		if retryableStatus(s) {
 			t.Errorf("HTTP %d should NOT be retryable", s)
 		}
+	}
+}
+
+// ─── cancellation ──────────────────────────────────────────────────────
+
+// countingServer answers every POST with the given status + body and
+// counts the requests it saw.
+func countingServer(t *testing.T, status int, body string) (*httptest.Server, *int32) {
+	t.Helper()
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+// shortRetries collapses the real backoff so a retry test runs in
+// milliseconds instead of seconds.
+func shortRetries(t *testing.T) {
+	t.Helper()
+	oldDelay, oldBaseline := pushRetryDelay, baselineRetryDelay
+	pushRetryDelay, baselineRetryDelay = 5*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { pushRetryDelay, baselineRetryDelay = oldDelay, oldBaseline })
+}
+
+// The achievement was re-locked before the push ever went out. Sending it
+// would announce a trophy the player just erased, and leave the server
+// unlocked against a locked Steam — with nothing left to detect, since
+// both sides then sit still.
+func TestPushUnlockCancelledBeforeFirstAttempt(t *testing.T) {
+	srv, hits := countingServer(t, 200, `{"status":"injected"}`)
+
+	cancel := make(chan struct{})
+	close(cancel)
+	pushUnlock(srv.URL, "token", 440, "ACH_A", "", nil, cancel)
+
+	if got := atomic.LoadInt32(hits); got != 0 {
+		t.Errorf("sent %d request(s) for an achievement that was already re-locked, want 0", got)
+	}
+}
+
+// The reset lands while the push is between two attempts: the retry must
+// die instead of arriving after the relock.
+func TestPushUnlockCancelledDuringBackoff(t *testing.T) {
+	shortRetries(t)
+	var hits int32
+	cancel := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			close(cancel) // the player resets right after the first failure
+		}
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+
+	pushUnlock(srv.URL, "token", 440, "ACH_A", "", nil, cancel)
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("made %d attempt(s) after the achievement was re-locked, want 1", got)
+	}
+}
+
+// Nothing was re-locked: a retryable failure still gets its full budget.
+func TestPushUnlockWithoutCancelStillRetries(t *testing.T) {
+	shortRetries(t)
+	srv, hits := countingServer(t, 500, ``)
+
+	pushUnlock(srv.URL, "token", 440, "ACH_A", "", nil, nil)
+
+	if got := atomic.LoadInt32(hits); got != int32(pushAttempts) {
+		t.Errorf("made %d attempt(s), want %d", got, pushAttempts)
+	}
+}
+
+// A relock of another achievement must not touch this push.
+func TestPushRelockGivingUpTellsTheUser(t *testing.T) {
+	shortRetries(t)
+	srv, hits := countingServer(t, 200, `{"status":"busy"}`)
+	// `state` is a global: clear it going in, and leave it clean for the
+	// next test rather than handing it a stale soft error.
+	state.recordRequestOK()
+	t.Cleanup(state.recordRequestOK)
+
+	pushRelock(srv.URL, "token", 440, []string{"ACH_A"}, nil)
+
+	if got := atomic.LoadInt32(hits); got != int32(pushAttempts) {
+		t.Errorf("made %d attempt(s), want %d", got, pushAttempts)
+	}
+	// A reset the streamer asked for, dropped silently, used to leave a
+	// green dot and an overlay still showing the old run.
+	if soft := state.snapshot().SoftError; soft == "" {
+		t.Error("giving up on a relock left no message for the user")
+	}
+}
+
+// A server that predates relocks answers 404. That is not the streamer's
+// problem and must not paint the tray amber — unlike unlock, whose route
+// has shipped for ages.
+func TestPushRelockOn404IsSilent(t *testing.T) {
+	shortRetries(t)
+	srv, hits := countingServer(t, 404, `{"statusCode":404}`)
+	state.recordRequestOK()
+	t.Cleanup(state.recordRequestOK)
+
+	pushRelock(srv.URL, "token", 440, []string{"ACH_A"}, nil)
+
+	if got := atomic.LoadInt32(hits); got != 1 {
+		t.Errorf("made %d attempt(s) against a server without the route, want 1", got)
+	}
+	if soft := state.snapshot().SoftError; soft != "" {
+		t.Errorf("404 from an old server surfaced as %q", soft)
+	}
+}
+
+// postJSON is now the single transport for both pushes: the headers both
+// depend on are asserted once, here.
+func TestPostJSONSendsAuthAndJSON(t *testing.T) {
+	var gotAuth, gotType, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotType = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"relocked"}`))
+	}))
+	defer srv.Close()
+
+	status, body, err := postJSON(srv.URL, "tok", "/api/companion/steam/relock",
+		relockPayload{AppID: 440, APINames: []string{"ACH_A"}})
+	if err != nil || status != 200 {
+		t.Fatalf("postJSON: status=%d err=%v", status, err)
+	}
+	if gotAuth != "Bearer tok" {
+		t.Errorf("Authorization = %q", gotAuth)
+	}
+	if gotType != "application/json" {
+		t.Errorf("Content-Type = %q", gotType)
+	}
+	if !strings.Contains(gotBody, `"appId":440`) || !strings.Contains(gotBody, `"ACH_A"`) {
+		t.Errorf("body = %q", gotBody)
+	}
+	if !strings.Contains(string(body), "relocked") {
+		t.Errorf("response body = %q", body)
+	}
+}
+
+// An unreachable host is a network failure, and a network failure is
+// worth retrying — the distinction postJSON's stage carries.
+func TestPostJSONNetworkErrorIsTagged(t *testing.T) {
+	_, _, err := postJSON("http://127.0.0.1:1", "tok", "/api/companion/steam/unlock", unlockPayload{})
+	pe, ok := err.(postError)
+	if !ok || pe.stage != "network" {
+		t.Fatalf("err = %#v, want a postError tagged network", err)
 	}
 }

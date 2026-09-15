@@ -64,7 +64,15 @@ func readKVChildren(r *bytes.Reader, parent *kvNode, depth int) error {
 	for {
 		typ, err := r.ReadByte()
 		if err == io.EOF {
-			return nil
+			// At the top level this is simply the end of the document. One
+			// level in, it means the file stops inside an object Steam
+			// never closed — a stats file caught mid-rewrite. Returning the
+			// partial tree there reads as "these achievements are gone" and
+			// pushes a relock of the whole game, so it has to be an error.
+			if depth == 0 {
+				return nil
+			}
+			return fmt.Errorf("kv: truncated document inside %q", parent.Name)
 		}
 		if err != nil {
 			return fmt.Errorf("kv: read type: %w", err)
