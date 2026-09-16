@@ -5,6 +5,7 @@
 #   make build       Cross-compile the Windows .exe (tray + cgo).
 #   make installer   Build the NSIS installer (depends on `build`).
 #   make mac         Sanity build on the host (no .exe, no tray UI).
+#   make harness     Build the local watch-loop harness (see tools/README.md).
 #   make clean       Remove built artefacts.
 #
 # Requirements (one-time setup):
@@ -35,7 +36,7 @@ GO_ENV      := CGO_ENABLED=1 \
                GOOS=windows GOARCH=amd64
 GO_LDFLAGS  := -s -w -H=windowsgui -X main.version=$(VERSION)
 
-.PHONY: build installer mac clean help stats
+.PHONY: build installer mac clean help stats harness
 
 build: $(BINARY)
 	@ls -lh $(BINARY)
@@ -65,6 +66,18 @@ mac:
 	@echo "→ Mac dev build (no tray on this platform — `help` only)…"
 	go build -o /tmp/streamtrackr-companion-mac .
 	/tmp/streamtrackr-companion-mac help
+
+# Local watch-loop harness: the real companion, a fake Steam tree and a
+# fake API, no Windows and no game. Scenarios in tools/README.md.
+HARNESS_DIR ?= /tmp/streamtrackr-harness
+
+harness:
+	@echo "→ Harness → $(HARNESS_DIR)…"
+	@mkdir -p $(HARNESS_DIR)
+	go build -o $(HARNESS_DIR)/companion .
+	go build -o $(HARNESS_DIR)/fakesteam ./tools/fakesteam
+	go build -o $(HARNESS_DIR)/fakeapi ./tools/fakeapi
+	@echo "   ready — see tools/README.md"
 
 clean:
 	rm -f $(BINARY) $(INSTALLER) $(SYSO)
